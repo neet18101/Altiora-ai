@@ -19,75 +19,19 @@ image = (
     .pip_install(
         "faster-whisper==1.0.3",
         "numpy",
+        "requests",
         "fastapi[standard]",
     )
 )
-# Create a volume to cache the model
-model_cache = modal.Volume.from_name("whisper-cache", create_if_missing=True)
+
+# ─── Web Endpoint (No Volume - Model downloads fresh each cold start) ───────
 
 
-# ─── STT Class ──────────────────────────────────────────────────────────────
-@app.cls(
-    image=image,
-    gpu="T4",
-    timeout=60,
-    scaledown_window=300,
-    volumes={"/root/.cache": model_cache},
-)
-class WhisperSTT:
-    @modal.enter()
-    def load_model(self):
-        """Load model when container starts."""
-        from faster_whisper import WhisperModel
-
-        self.model = WhisperModel(
-            "base",
-            device="cuda",
-            compute_type="float16",
-        )
-        print("✅ Whisper model loaded!")
-
-    @modal.method()
-    def transcribe(self, audio_bytes: bytes, language: str = "en") -> dict:
-        """
-        Transcribe audio bytes to text.
-        """
-        import tempfile
-        import time
-
-        start = time.time()
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-            f.write(audio_bytes)
-            f.flush()
-
-            segments, info = self.model.transcribe(
-                f.name,
-                language=language,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-            )
-
-            text = " ".join(segment.text.strip() for segment in segments)
-
-        elapsed = time.time() - start
-
-        return {
-            "text": text,
-            "language": info.language,
-            "duration": elapsed,
-            "audio_duration": info.duration,
-        }
-
-
-# ─── Web Endpoint ───────────────────────────────────────────────────────────
 @app.function(
     image=image,
     gpu="T4",
-    timeout=60,
+    timeout=120,
     scaledown_window=300,
-    volumes={"/root/.cache": model_cache},
 )
 @modal.fastapi_endpoint(method="POST")
 async def transcribe_audio(request: dict):
@@ -99,8 +43,8 @@ async def transcribe_audio(request: dict):
     """
     from faster_whisper import WhisperModel
     import tempfile
-    import time
     import base64
+    import os
 
     audio_b64 = request.get("audio", "")
     language = request.get("language", "en")
@@ -108,24 +52,33 @@ async def transcribe_audio(request: dict):
     if not audio_b64:
         return {"text": "", "error": "No audio provided"}
 
-    audio_bytes = base64.b64decode(audio_b64)
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
 
-    model = WhisperModel("base", device="cuda", compute_type="float16")
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-        f.write(audio_bytes)
-        f.flush()
-
-        segments, info = model.transcribe(
-            f.name,
-            language=language if language != "auto" else None,
-            beam_size=5,
-            vad_filter=True,
+        # Load model (cached in container memory during warm period)
+        model = WhisperModel(
+            "base",
+            device="cuda",
+            compute_type="float16",
         )
 
-        text = " ".join(segment.text.strip() for segment in segments)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+            f.write(audio_bytes)
+            f.flush()
 
-    return {"text": text, "language": info.language}
+            segments, info = model.transcribe(
+                f.name,
+                language=language if language != "auto" else None,
+                beam_size=5,
+                vad_filter=True,
+            )
+
+            text = " ".join(segment.text.strip() for segment in segments)
+
+        return {"text": text, "language": info.language}
+
+    except Exception as e:
+        return {"text": "", "error": str(e)}
 
 
 # ─── Local Testing ──────────────────────────────────────────────────────────

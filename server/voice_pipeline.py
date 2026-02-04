@@ -3,9 +3,9 @@ Voice Pipeline Orchestrator
 ============================
 Handles the full flow: Audio -> STT -> LLM -> TTS -> Audio
 
-- STT: Modal (Whisper)
-- LLM: Modal (Mistral)  
-- TTS: Direct ElevenLabs API (no Modal needed!)
+- STT: RunPod (Whisper)
+- LLM: RunPod (Llama 3.1)  
+- TTS: ElevenLabs SDK
 """
 
 import asyncio
@@ -17,6 +17,7 @@ import tempfile
 import os
 
 import httpx
+from elevenlabs import ElevenLabs
 
 from audio_utils import pcm_to_wav_bytes, wav_bytes_to_pcm, resample
 from config import config
@@ -41,6 +42,8 @@ class ConversationState:
 
 
 class MockPipeline:
+    """Mock pipeline for testing without external services"""
+
     RESPONSES = [
         "I understand. Let me help you with that.",
         "That's a great question.",
@@ -74,23 +77,33 @@ class MockPipeline:
         return b"".join(samples)
 
 
-class ModalPipeline:
-    """STT/LLM on Modal, TTS direct from ElevenLabs"""
+class RunPodPipeline:
+    """Production Pipeline: STT/LLM on RunPod, TTS via ElevenLabs SDK"""
 
     def __init__(self):
         self.http_client = httpx.AsyncClient(timeout=120.0)
 
-        # Modal endpoints
-        self.stt_url = "https://neet18101--altiora-stt-transcribe-audio.modal.run"
-        self.llm_url = "https://neet18101--altiora-llm-chat.modal.run"
+        # RunPod endpoints
+        self.stt_url = config.MODAL_STT_URL  # Points to RunPod now
+        self.llm_url = config.MODAL_LLM_URL  # Points to RunPod now
 
-        # ElevenLabs - Direct API (no Modal!)
-        self.elevenlabs_key = "sk_2ff8836c7112d906956265b576f8ae9a28b4cfc64bee8767"
-        self.voice_id = "21m00Tcm4TlvDq8ikWAM"  # Rachel
+        # ElevenLabs SDK client
+        self.elevenlabs_key = config.ELEVENLABS_API_KEY
+        self.voice_id = config.ELEVENLABS_VOICE_ID
+        self.elevenlabs_client = None
 
-        logger.info("✅ Pipeline: STT/LLM=Modal, TTS=ElevenLabs Direct")
+        if not self.elevenlabs_key:
+            logger.warning("⚠️ ELEVENLABS_API_KEY not set in .env!")
+        else:
+            self.elevenlabs_client = ElevenLabs(api_key=self.elevenlabs_key)
+
+        logger.info(f"✅ Pipeline Ready:")
+        logger.info(f"   STT: {self.stt_url}")
+        logger.info(f"   LLM: {self.llm_url}")
+        logger.info(f"   TTS: ElevenLabs (Voice: {self.voice_id})")
 
     async def speech_to_text(self, audio_pcm_16k: bytes) -> str:
+        """Convert speech to text using RunPod Whisper"""
         start = time.time()
         wav_bytes = pcm_to_wav_bytes(audio_pcm_16k, sample_rate=16000)
         audio_b64 = base64.b64encode(wav_bytes).decode()
@@ -101,7 +114,14 @@ class ModalPipeline:
                 json={"audio": audio_b64, "language": "en"},
             )
             r.raise_for_status()
-            text = r.json().get("text", "").strip()
+            response_data = r.json()
+            text = response_data.get("text", "").strip()
+            error = response_data.get("error", "")
+
+            if error:
+                logger.error(f"[STT] Server error: {error}")
+                return ""
+
             logger.info(f"[STT] {time.time()-start:.2f}s: '{text}'")
             return text
         except Exception as e:
@@ -109,14 +129,18 @@ class ModalPipeline:
             return ""
 
     async def generate_response(self, state: ConversationState, user_text: str) -> str:
+        """Generate AI response using RunPod Llama 3.1"""
         start = time.time()
         state.add_user_message(user_text)
 
         try:
             r = await self.http_client.post(
                 self.llm_url,
-                json={"messages": state.get_messages(), "max_tokens": 150,
-                      "temperature": 0.7},
+                json={
+                    "messages": state.get_messages(),
+                    "max_tokens": config.LLM_MAX_TOKENS,
+                    "temperature": config.LLM_TEMPERATURE
+                },
             )
             r.raise_for_status()
             choices = r.json().get("choices", [])
@@ -131,39 +155,60 @@ class ModalPipeline:
             return "I'm having trouble. Please repeat."
 
     async def text_to_speech(self, text: str) -> bytes:
-        """Direct ElevenLabs API - no Modal!"""
+        """Convert text to speech using ElevenLabs SDK"""
         start = time.time()
 
+        if not self.elevenlabs_client:
+            logger.error("[TTS] ElevenLabs client not initialized!")
+            return b""
+
         try:
-            r = await self.http_client.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}",
-                headers={"xi-api-key": self.elevenlabs_key,
-                         "Content-Type": "application/json"},
-                json={
-                    "text": text,
-                    "model_id": "eleven_monolingual_v1",
-                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-                }
+            # Run sync SDK call in thread pool
+            loop = asyncio.get_event_loop()
+            audio_generator = await loop.run_in_executor(
+                None,
+                lambda: self.elevenlabs_client.text_to_speech.convert(
+                    text=text,
+                    voice_id=self.voice_id,
+                    model_id="eleven_flash_v2_5",
+                    output_format="mp3_44100_128",
+                )
             )
 
-            if r.status_code != 200:
-                logger.error(f"[TTS] ElevenLabs error: {r.status_code}")
+            # Collect audio chunks
+            mp3_bytes = b""
+            for chunk in audio_generator:
+                mp3_bytes += chunk
+
+            if not mp3_bytes:
+                logger.error("[TTS] No audio generated!")
                 return b""
 
-            # Convert MP3 to PCM 8kHz
-            mp3_bytes = r.content
-
+            # Save MP3 to temp file
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 f.write(mp3_bytes)
                 mp3_path = f.name
 
+            # Convert to WAV 8kHz for Twilio
             wav_path = mp3_path.replace(".mp3", ".wav")
-            subprocess.run(["ffmpeg", "-y", "-i", mp3_path, "-ar", "8000", "-ac", "1", "-f", "wav", wav_path],
-                           capture_output=True, timeout=10)
 
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", mp3_path, "-ar",
+                    "8000", "-ac", "1", "-f", "wav", wav_path],
+                capture_output=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                logger.error(f"[TTS] ffmpeg error: {result.stderr.decode()}")
+                os.unlink(mp3_path)
+                return b""
+
+            # Read PCM data
             with open(wav_path, "rb") as f:
                 pcm_data, _ = wav_bytes_to_pcm(f.read())
 
+            # Cleanup temp files
             os.unlink(mp3_path)
             os.unlink(wav_path)
 
@@ -176,16 +221,20 @@ class ModalPipeline:
             return b""
 
     async def close(self):
+        """Cleanup HTTP client"""
         await self.http_client.aclose()
 
 
 def create_pipeline():
+    """Factory function to create appropriate pipeline based on config"""
     mode = config.PIPELINE_MODE.lower()
+
     if mode == "mock":
-        logger.info("🎭 MOCK mode")
+        logger.info("🎭 MOCK mode - Using test responses")
         return MockPipeline()
-    elif mode == "modal":
-        logger.info("🚀 MODAL mode (TTS=ElevenLabs Direct)")
-        return ModalPipeline()
+    elif mode == "modal" or mode == "runpod":
+        logger.info("🚀 RUNPOD mode - Production pipeline")
+        return RunPodPipeline()
     else:
+        logger.warning(f"⚠️ Unknown mode '{mode}', defaulting to MOCK")
         return MockPipeline()

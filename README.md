@@ -226,3 +226,9 @@ curl -X POST "http://localhost:8000/voice/outbound" -H "Content-Type: applicatio
 ---
 
 **Ye pura message kal naye conversation mein paste kar dena, main samajh jaunga!** 👍
+
+
+
+
+supbase key 
+WcV24vTJXiuZ0oVQ

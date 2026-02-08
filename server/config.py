@@ -71,6 +71,10 @@ If you don't understand something, politely ask for clarification.""")
     DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
     LOG_AUDIO: bool = os.getenv("LOG_AUDIO", "false").lower() == "true"
 
+    # ─── SaaS Backend Integration ───────────────────────────────────────────
+    SAAS_BACKEND_URL: str = os.getenv(
+        "SAAS_BACKEND_URL", "http://localhost:5000")
+
 
 # Create global config instance
 config = Config()

@@ -45,7 +45,8 @@ app = FastAPI(
 # ─── Twilio Client ───────────────────────────────────────────────────────────
 twilio_client = None
 if config.TWILIO_ACCOUNT_SID and config.TWILIO_AUTH_TOKEN:
-    twilio_client = TwilioClient(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+    twilio_client = TwilioClient(
+        config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -124,7 +125,17 @@ async def voice_outbound(request: Request):
     Trigger an outbound call from the AI to a phone number.
 
     JSON body:
-      { "to": "+1234567890" }
+      {
+        "to": "+1234567890",
+        "business_id": "uuid",
+        "agent_id": "uuid",
+        "agent_config": {
+          "name": "Agent Name",
+          "system_prompt": "You are a helpful assistant...",
+          "personality": "friendly",
+          "language": "en"
+        }
+      }
 
     The AI will call the number and connect via Media Stream.
     """
@@ -133,18 +144,37 @@ async def voice_outbound(request: Request):
 
     data = await request.json()
     to_number = data.get("to")
+    business_id = data.get("business_id", "")
+    agent_id = data.get("agent_id", "")
+    agent_config = data.get("agent_config", {})
 
     if not to_number:
         return {"error": "Missing 'to' phone number"}, 400
 
     logger.info(f"=== OUTBOUND CALL TO {to_number} ===")
+    logger.info(f"Agent: {agent_config.get('name', 'Default')}")
 
-    # Build TwiML for the outbound call
+    # Store agent config for this call (will be used by twilio_handler)
+    # We pass essential info via TwiML parameters
+    import urllib.parse
+    system_prompt_encoded = urllib.parse.quote(
+        agent_config.get("system_prompt", "")[:500])
+    greeting_encoded = urllib.parse.quote(
+        agent_config.get("greeting_message", "Hello! How can I help you today?"))
+
+    # Build TwiML for the outbound call with custom parameters
+    stream_url = config.PUBLIC_URL.replace(
+        'https://', '').replace('http://', '')
     twiml = f"""
     <Response>
         <Connect>
-            <Stream url="wss://{config.PUBLIC_URL.replace('https://', '').replace('http://', '')}/voice/stream" name="altiora-stream">
+            <Stream url="wss://{stream_url}/voice/stream" name="altiora-stream">
                 <Parameter name="direction" value="both"/>
+                <Parameter name="business_id" value="{business_id}"/>
+                <Parameter name="agent_id" value="{agent_id}"/>
+                <Parameter name="agent_name" value="{agent_config.get('name', 'AI Assistant')}"/>
+                <Parameter name="system_prompt" value="{system_prompt_encoded}"/>
+                <Parameter name="greeting_message" value="{greeting_encoded}"/>
             </Stream>
         </Connect>
     </Response>
@@ -173,7 +203,8 @@ async def voice_status(request: Request):
     call_sid = form.get("CallSid", "unknown")
     status = form.get("CallStatus", "unknown")
     duration = form.get("CallDuration", "0")
-    logger.info(f"Call status update — {call_sid}: {status} (duration: {duration}s)")
+    logger.info(
+        f"Call status update — {call_sid}: {status} (duration: {duration}s)")
     return {"status": "ok"}
 
 

@@ -19,6 +19,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+import httpx
 from fastapi import WebSocket
 
 from audio_utils import (
@@ -30,8 +31,94 @@ from audio_utils import (
     resample,
 )
 from voice_pipeline import ConversationState, create_pipeline
+from config import config
 
 logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEBHOOK CLIENT - Send events to SaaS Backend
+# ═══════════════════════════════════════════════════════════════════════════════
+class WebhookClient:
+    """Send call events to SaaS backend for logging."""
+
+    def __init__(self):
+        self.base_url = config.SAAS_BACKEND_URL
+        self.client = httpx.AsyncClient(timeout=10.0)
+        logger.info(f"📡 Webhook client ready: {self.base_url}")
+
+    async def call_started(self, business_id: str, agent_id: str, direction: str,
+                           from_number: str, to_number: str, twilio_call_sid: str) -> str:
+        """Notify backend when call starts. Returns call_id."""
+        try:
+            r = await self.client.post(
+                f"{self.base_url}/api/webhooks/call-started",
+                json={
+                    "business_id": business_id,
+                    "agent_id": agent_id,
+                    "direction": direction,
+                    "from_number": from_number,
+                    "to_number": to_number,
+                    "twilio_call_sid": twilio_call_sid,
+                }
+            )
+            data = r.json()
+            call_id = data.get("data", {}).get("call_id", "")
+            logger.info(f"[WEBHOOK] ✅ call-started: call_id={call_id}")
+            return call_id
+        except Exception as e:
+            logger.error(f"[WEBHOOK] ❌ call-started error: {e}")
+            return ""
+
+    async def call_ended(self, call_id: str, duration_secs: int, outcome: str = "completed",
+                         sentiment: str = None, summary: str = None):
+        """Notify backend when call ends."""
+        if not call_id:
+            return
+        try:
+            await self.client.post(
+                f"{self.base_url}/api/webhooks/call-ended",
+                json={
+                    "call_id": call_id,
+                    "duration_secs": duration_secs,
+                    "outcome": outcome,
+                    "sentiment": sentiment,
+                    "summary": summary,
+                }
+            )
+            logger.info(f"[WEBHOOK] ✅ call-ended: {duration_secs}s")
+        except Exception as e:
+            logger.error(f"[WEBHOOK] ❌ call-ended error: {e}")
+
+    async def transcript(self, call_id: str, speaker: str, message: str,
+                         timestamp_secs: float = None, stt_duration_ms: int = None,
+                         llm_duration_ms: int = None, tts_duration_ms: int = None):
+        """Send transcript line to backend."""
+        if not call_id:
+            return
+        try:
+            await self.client.post(
+                f"{self.base_url}/api/webhooks/transcript",
+                json={
+                    "call_id": call_id,
+                    "speaker": speaker,
+                    "message": message,
+                    "timestamp_secs": timestamp_secs,
+                    "stt_duration_ms": stt_duration_ms,
+                    "llm_duration_ms": llm_duration_ms,
+                    "tts_duration_ms": tts_duration_ms,
+                }
+            )
+            logger.debug(f"[WEBHOOK] transcript: {speaker}: {message[:50]}...")
+        except Exception as e:
+            logger.error(f"[WEBHOOK] ❌ transcript error: {e}")
+
+    async def close(self):
+        await self.client.aclose()
+
+
+# Global webhook client
+webhook_client = WebhookClient()
 
 
 @dataclass
@@ -47,12 +134,24 @@ class CallSession:
     speech_started: bool = False        # Has caller started speaking?
 
     # ═══ TUNED PARAMETERS ═══
-    silence_threshold: float = 1.0      # Seconds of silence before processing
-    min_audio_length: int = 16000       # Min PCM bytes (~500ms at 16kHz)
-    speech_energy_threshold: int = 300  # Energy level to detect speech
+    # Seconds of silence before processing (was 1.0)
+    silence_threshold: float = 0.7
+    # Min PCM bytes (~375ms at 16kHz) (was 16000)
+    min_audio_length: int = 12000
+    # Energy level to detect speech (was 300)
+    speech_energy_threshold: int = 150
 
     greeting_sent: bool = False
     audio_chunks_received: int = 0      # Debug counter
+
+    # ═══ WEBHOOK TRACKING ═══
+    call_id: str = ""                   # Returned from SaaS backend
+    business_id: str = ""               # Set by main.py
+    agent_id: str = ""                  # Set by main.py
+    from_number: str = ""               # Caller number
+    to_number: str = ""                 # Called number
+    call_start_time: float = 0.0        # For duration calc
+    greeting_message: str = "Hello! Thanks for calling. How can I help you today?"
 
 
 class TwilioWebSocketHandler:
@@ -92,10 +191,55 @@ class TwilioWebSocketHandler:
                 elif event == "start":
                     session.stream_sid = data["start"]["streamSid"]
                     session.call_sid = data["start"]["callSid"]
+                    session.call_start_time = time.time()
+
+                    # Get from/to from start data if available
+                    start_data = data.get("start", {})
+                    custom_params = start_data.get("customParameters", {})
+                    session.business_id = custom_params.get("business_id", "")
+                    session.agent_id = custom_params.get("agent_id", "")
+                    session.from_number = start_data.get("from", "")
+                    session.to_number = start_data.get("to", "")
+
+                    # Extract agent's system prompt (URL decoded)
+                    import urllib.parse
+                    system_prompt = custom_params.get("system_prompt", "")
+                    if system_prompt:
+                        system_prompt = urllib.parse.unquote(system_prompt)
+                        session.conversation = ConversationState(
+                            system_prompt=system_prompt)
+                        logger.info(
+                            f"Using custom system prompt: {system_prompt[:100]}...")
+
+                    # Extract greeting message
+                    greeting_msg = custom_params.get("greeting_message", "")
+                    if greeting_msg:
+                        session.greeting_message = urllib.parse.unquote(
+                            greeting_msg)
+                        logger.info(
+                            f"Using custom greeting: {session.greeting_message[:50]}...")
+
+                    agent_name = custom_params.get(
+                        "agent_name", "AI Assistant")
+
                     logger.info(
                         f"Stream started — callSid={session.call_sid}, "
-                        f"streamSid={session.stream_sid}"
+                        f"streamSid={session.stream_sid}, agent={agent_name}"
                     )
+
+                    # Notify SaaS backend of call start
+                    # If business_id is passed via params, it's an outbound call
+                    call_direction = "outbound" if session.business_id else "inbound"
+                    call_id = await webhook_client.call_started(
+                        business_id=session.business_id,
+                        agent_id=session.agent_id,
+                        direction=call_direction,
+                        from_number=session.from_number,
+                        to_number=session.to_number,
+                        twilio_call_sid=session.call_sid,
+                    )
+                    session.call_id = call_id
+
                     # Send greeting on first connection
                     if not session.greeting_sent:
                         session.greeting_sent = True
@@ -114,7 +258,18 @@ class TwilioWebSocketHandler:
             logger.error(f"WebSocket error: {e}", exc_info=True)
         finally:
             silence_task.cancel()
-            logger.info(f"Call ended — callSid={session.call_sid}")
+
+            # Calculate call duration and notify backend
+            duration_secs = int(
+                time.time() - session.call_start_time) if session.call_start_time > 0 else 0
+            await webhook_client.call_ended(
+                call_id=session.call_id,
+                duration_secs=duration_secs,
+                outcome="completed",
+            )
+
+            logger.info(
+                f"Call ended — callSid={session.call_sid}, duration={duration_secs}s")
 
     async def _handle_media(self, websocket: WebSocket, session: CallSession, data: dict):
         """Process incoming audio from Twilio."""
@@ -224,12 +379,17 @@ class TwilioWebSocketHandler:
 
         session.is_processing = True
         start_time = time.time()
+        stt_duration_ms = 0
+        llm_duration_ms = 0
+        tts_duration_ms = 0
 
         try:
             # ── Step 1: Speech to Text ──
+            stt_start = time.time()
             logger.info(
                 f"[PIPELINE] 🎤 Processing {len(audio_pcm_16k)} bytes of audio...")
             transcript = await self.pipeline.speech_to_text(audio_pcm_16k)
+            stt_duration_ms = int((time.time() - stt_start) * 1000)
 
             if not transcript or len(transcript.strip()) < 2:
                 logger.info("[PIPELINE] ❌ Empty transcript — ignoring")
@@ -237,20 +397,46 @@ class TwilioWebSocketHandler:
 
             logger.info(f"[PIPELINE] 📝 Caller said: '{transcript}'")
 
+            # Send caller transcript to backend
+            timestamp_secs = time.time() - session.call_start_time
+            await webhook_client.transcript(
+                call_id=session.call_id,
+                speaker="caller",
+                message=transcript,
+                timestamp_secs=timestamp_secs,
+                stt_duration_ms=stt_duration_ms,
+            )
+
             # ── Step 2: LLM Response ──
+            llm_start = time.time()
             logger.info("[PIPELINE] 🤖 Generating AI response...")
             response_text = await self.pipeline.generate_response(
                 session.conversation, transcript
             )
+            llm_duration_ms = int((time.time() - llm_start) * 1000)
             logger.info(f"[PIPELINE] 💬 AI responds: '{response_text}'")
 
             # ── Step 3: Text to Speech ──
+            tts_start = time.time()
             logger.info("[PIPELINE] 🔊 Generating speech...")
             tts_pcm = await self.pipeline.text_to_speech(response_text)
+            tts_duration_ms = int((time.time() - tts_start) * 1000)
 
             if not tts_pcm:
                 logger.warning("[PIPELINE] ❌ TTS returned empty audio")
                 return
+
+            # Send AI response transcript to backend
+            timestamp_secs = time.time() - session.call_start_time
+            await webhook_client.transcript(
+                call_id=session.call_id,
+                speaker="agent",
+                message=response_text,
+                timestamp_secs=timestamp_secs,
+                stt_duration_ms=stt_duration_ms,
+                llm_duration_ms=llm_duration_ms,
+                tts_duration_ms=tts_duration_ms,
+            )
 
             # ── Step 4: Stream audio back to Twilio ──
             total_time = time.time() - start_time
@@ -309,7 +495,7 @@ class TwilioWebSocketHandler:
         """Send an initial greeting when the call connects."""
         await asyncio.sleep(0.5)  # Small delay for stream to stabilize
 
-        greeting = "Hello! Thanks for calling. How can I help you today?"
+        greeting = session.greeting_message
         logger.info(f"[GREETING] 👋 Sending: '{greeting}'")
 
         session.conversation.add_assistant_message(greeting)

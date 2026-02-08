@@ -232,3 +232,74 @@ curl -X POST "http://localhost:8000/voice/outbound" -H "Content-Type: applicatio
 
 supbase key 
 WcV24vTJXiuZ0oVQ
+
+
+
+Tumhare FastAPI voice server mein ye 4 changes karne hain:
+
+.env mein SAAS_BACKEND_URL=http://localhost:5000 add karo
+Jab inbound call aaye (/voice/inbound) — Node.js backend ko call-started webhook bhejo (caller, to_number, call_sid, direction)
+Jab call khatam ho (/voice/status) — Node.js backend ko call-ended webhook bhejo (call_sid, duration)
+Jab har message process ho (tumhare voice_pipeline.py ya twilio_handler.py mein jahan STT → LLM → TTS hota hai) — Node.js backend ko transcript webhook bhejo (call_id, speaker, message)
+
+Bas itna hi. Tumhara FastAPI server wahi kaam karega jo kar raha hai — bus har event pe ek HTTP POST extra marega Node.js backend ko, taaki SaaS dashboard mein call logs aur transcripts dikhen.
+
+==============================================================================================================
+
+
+10:14 PM
+Tumhare Node.js backend mein 3 webhook APIs hain jo FastAPI call karega:
+
+1. /api/webhooks/call-started (POST)
+
+Kab: Jab call shuru ho (inbound ya outbound)
+Body bhejo:
+json
+{
+  "business_id": "uuid",
+  "agent_id": "uuid",
+  "direction": "inbound",
+  "from_number": "+919999999999",
+  "to_number": "+12722036919",
+  "twilio_call_sid": "CAxxxxxxxx"
+}
+Response milega: { "call_id": "uuid" } — ye save karo, baaki webhooks mein chahiye
+2. /api/webhooks/call-ended (POST)
+
+Kab: Jab call khatam ho
+Body bhejo:
+json
+{
+  "call_id": "uuid",
+  "duration_secs": 45,
+  "outcome": "completed",
+  "sentiment": "positive",
+  "summary": "Customer asked about pricing"
+}
+3. /api/webhooks/transcript (POST)
+
+Kab: Har message ke baad (caller bole ya AI bole)
+Body bhejo:
+json
+{
+  "call_id": "uuid",
+  "speaker": "caller",
+  "message": "Hello, I need help with my order",
+  "timestamp_secs": 5.2,
+  "stt_duration_ms": 800,
+  "llm_duration_ms": 500,
+  "tts_duration_ms": 900
+}
+```
+`speaker` value: `"caller"` ya `"agent"`
+
+---
+
+**Flow:**
+```
+Call shuru → /call-started (call_id milega)
+    ↓
+Har message → /transcript (call_id use karo)
+    ↓
+Call khatam → /call-ended (call_id use karo)
+Bas ye 3 API calls FastAPI se maaro — saara data dashboard mein aa jayega. Bolo toh FastAPI side ka code bhi de doon?

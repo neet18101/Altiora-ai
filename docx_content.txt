@@ -1,0 +1,194 @@
+
+============================================================
+FILE: Altiora_AI_Documentation.docx
+============================================================
+ALTIORA AI
+Voice Calling Platform - Complete Documentation
+February 4, 2026
+1. Project Overview
+Altiora AI is an AI-powered voice calling platform that handles real phone calls using AI. The system converts speech to text, generates intelligent responses, and converts text back to speech in real-time.
+System Architecture
+Call Flow
+Phone Call → Twilio → Server → STT (Whisper) → LLM (Llama) → TTS (ElevenLabs) → Audio Response
+2. RunPod Setup
+GPU Selection
+Recommended: RTX 4000 Ada ($0.26/hr) - 20GB VRAM, sufficient for Llama 3.2 3B + Whisper
+Installation Commands
+# Step 1: Install dependencies
+apt update && apt install -y ffmpeg zstd
+# Step 2: Install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+# Step 3: Start Ollama & Pull model
+ollama serve &
+sleep 5 && ollama pull llama3.2:3b
+# Step 4: Install Python packages
+pip install faster-whisper fastapi uvicorn httpx
+3. RunPod Server Code (server.py)
+"""
+Altiora AI - RunPod Server
+STT (Whisper) + LLM (Llama 3.1) API Server
+"""
+import asyncio, base64, tempfile, time, logging
+from fastapi import FastAPI
+from pydantic import BaseModel
+import httpx
+app = FastAPI(title='Altiora AI - RunPod Server')
+whisper_model = None
+@app.on_event('startup')
+async def load_models():
+    global whisper_model
+    from faster_whisper import WhisperModel
+    whisper_model = WhisperModel('base', device='cuda', compute_type='float16')
+@app.get('/health')
+async def health():
+    return {'status': 'ok', 'stt': 'whisper', 'llm': 'llama3.1'}
+@app.post('/stt')  # Speech-to-Text endpoint
+@app.post('/llm')  # LLM chat endpoint
+# See full code in server.py file
+4. Local Server Configuration
+Environment Variables (.env)
+# Server Settings
+SERVER_HOST=0.0.0.0
+SERVER_PORT=8000
+PUBLIC_URL=https://your-ngrok-url.ngrok.io
+PIPELINE_MODE=modal
+# Twilio Credentials
+TWILIO_ACCOUNT_SID=ACxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxx
+TWILIO_PHONE_NUMBER=+12722036919
+# ElevenLabs TTS
+ELEVENLABS_API_KEY=sk_xxxxxxxx
+ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM
+# RunPod Endpoints
+MODAL_STT_URL=https://your-runpod-url/stt
+MODAL_LLM_URL=https://your-runpod-url/llm
+5. Project File Structure
+E:\2026\altiora-modal\
+├── server/
+│   ├── main.py           # FastAPI server
+│   ├── config.py         # Configuration
+│   ├── voice_pipeline.py # STT/LLM/TTS pipeline
+│   ├── twilio_handler.py # WebSocket handler
+│   ├── audio_utils.py    # Audio conversion
+│   └── .env              # Environment vars
+└── venv/                 # Python virtual env
+6. Running the System
+Step 1: Start RunPod Server
+# In RunPod terminal:
+ollama serve &
+python server.py &
+Step 2: Start ngrok
+ngrok http 8000
+Step 3: Start Local Server
+cd E:\2026\altiora-modal\server
+.\venv\Scripts\Activate
+python main.py
+Step 4: Make Test Call
+curl -X POST "http://localhost:8000/voice/outbound" -H "Content-Type: application/json" -d "{\"to\": \"+918887061958\"}"
+7. Performance Results
+8. Estimated Costs
+9. Summary
+Altiora AI is now a fully functional AI voice calling platform capable of:
+Receiving and making phone calls via Twilio
+Converting speech to text using Whisper on RunPod GPU
+Generating intelligent responses using Llama 3.2 3B
+Converting text to natural speech using ElevenLabs
+Real-time bidirectional audio streaming
+Barge-in detection (caller can interrupt AI)
+--- End of Documentation ---
+
+============================================================
+FILE: Altiora_AI_Handoff_Document.docx
+============================================================
+ALTIORA AI
+Project Handoff Document
+For Continuing Development in Next Session
+Last Updated: February 4, 2026
+⚠️ IMPORTANT: Read this document first before starting any work!
+1. Project Overview
+Altiora AI is an AI-powered Voice Calling SaaS platform. AI agents make and receive real phone calls, have natural conversations, and handle business tasks like sales, support, and appointments.
+System Architecture
+Phone Call → Twilio → Local Server → RunPod (STT+LLM) → ElevenLabs (TTS) → Audio Response
+2. Critical URLs & Endpoints
+⚠️ RunPod URL may change if pod restarts - verify before use!
+3. Project File Locations
+Local Machine (Windows)
+E:\2026\altiora-modal\server\
+├── main.py              # FastAPI server entry point
+├── config.py            # Configuration settings
+├── voice_pipeline.py    # STT/LLM/TTS orchestration
+├── twilio_handler.py    # WebSocket handler + VAD
+├── audio_utils.py       # Audio format conversion
+└── .env                 # Credentials (KEEP SECRET)
+RunPod Server
+/workspace/server.py     # STT + LLM API endpoints
+4. Current Progress
+Twilio inbound/outbound calls - WORKING
+Speech-to-Text (Whisper) - WORKING (~0.5-1.8s)
+LLM responses (Llama 3.2) - WORKING (~0.5-1.0s)
+Text-to-Speech (ElevenLabs) - WORKING (~0.8-1.0s)
+Barge-in detection - WORKING
+Total response time: ~3-4 seconds
+Database (PostgreSQL) - NOT DONE
+User Authentication - NOT DONE
+Admin Dashboard (React/Next.js) - NOT DONE
+Business Configuration Portal - NOT DONE
+Stripe Billing Integration - NOT DONE
+Call Recording & Analytics - NOT DONE
+5. NEXT SESSION TASKS (Phase 2)
+🎯 Goal: Build multi-tenant SaaS platform with dashboard and billing
+Database Setup - PostgreSQL schema for users, businesses, calls, subscriptions
+User Authentication - Login/Signup system (JWT or NextAuth)
+Admin Dashboard - React/Next.js frontend for business management
+Business Configuration - AI personality, scripts, FAQs per tenant
+Stripe Integration - Subscription plans and usage billing
+Call Logs & Analytics - Store recordings, transcripts, metrics
+6. How to Start Working
+Step 1: Verify RunPod is Running
+# Check health endpoint
+curl https://ygs5npmp17vg1c-8000.proxy.runpod.net/health
+Step 2: If RunPod Stopped, Restart It
+# In RunPod terminal:
+ollama serve &
+python server.py &
+Step 3: Start Local Server
+cd E:\2026\altiora-modal\server
+.\venv\Scripts\Activate
+python main.py
+Step 4: Test Call (Optional)
+curl -X POST "http://localhost:8000/voice/outbound" -H "Content-Type: application/json" -d "{\"to\": \"+918887061958\"}"
+7. Environment Variables (.env)
+# Server
+SERVER_HOST=0.0.0.0
+SERVER_PORT=8000
+PIPELINE_MODE=modal
+# RunPod Endpoints
+MODAL_STT_URL=https://ygs5npmp17vg1c-8000.proxy.runpod.net/stt
+MODAL_LLM_URL=https://ygs5npmp17vg1c-8000.proxy.runpod.net/llm
+# Twilio (credentials in actual .env file)
+# ElevenLabs (credentials in actual .env file)
+--- Attach this document in next chat session ---
+Claude will read this and understand the full project context! 🚀
+
+============================================================
+FILE: Altiora_AI_Progress_Report.docx
+============================================================
+ALTIORA AI
+Project Progress Report
+PRD vs Current Implementation
+February 4, 2026
+Executive Summary
+The core voice calling functionality of Altiora AI is now FULLY OPERATIONAL. The AI can make and receive real phone calls, understand speech, generate intelligent responses, and speak back to callers in real-time.
+COMPLETED FEATURES
+1. Core AI Voice Agent Capabilities
+2. AI Voice Processing Flow
+3. AI Hosting & Deployment
+PENDING FEATURES
+Current Technology Stack
+Recommended Next Steps
+Phase 2: Build Multi-tenant Database Schema (PostgreSQL)
+Phase 3: Create Admin Dashboard (React/Next.js)
+Phase 4: Integrate Stripe Billing
+Phase 5: Add Call Recording & Analytics
+Phase 6: Dockerize for Production Deployment
+--- Thank You! Let's Build the Future Together! ---
